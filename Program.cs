@@ -1,7 +1,7 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Collections.Generic;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 
@@ -11,11 +11,35 @@ namespace OrderMatchingEngine
     {
         static void Main(string[] args)
         {
-            Console.WriteLine("Hello World!");
+            var operationHandler = DependencyServiceProvider.Get().GetService<IOperationHandler>();
+            
+            while (true)
+            {
+                var argument = Console.ReadLine();
+
+                if (string.IsNullOrEmpty(argument))
+                    break;
+
+                if (argument == OperationType.Print)
+                {
+                    operationHandler.Print();
+                }
+                else
+                {
+                    var operation = OperationsFactory.Get(argument);
+                    operationHandler.Process(operation);
+                }              
+            }
         }
     }
 
-    internal class OperationHandler
+    internal interface IOperationHandler
+    {
+        void Print();
+        void Process(Operation operation);
+    }
+
+    internal class OperationHandler : IOperationHandler
     {
         public OperationHandler(IBuySellOperationHandler buyOperationHandler, IBuySellOperationHandler sellOperationHandler)
         {
@@ -23,44 +47,128 @@ namespace OrderMatchingEngine
             _sellOperationHandler = sellOperationHandler;
         }
 
-        public string Print()
+        public void Print()
         {
             var result = new StringBuilder();
             result.Append("SELL:").Append(Environment.NewLine);
 
-            foreach (var (key, value) in _sellOperationHandler.HistoricalBuySellPriceToQuantityMap)
+            foreach (var (key, value) in _sellOperationHandler.BuySellPriceToQuantityMap.OrderByDescending(e => e.Key))
             {
                 result.Append($"{key} {value}").Append(Environment.NewLine);
             }
             
             result.Append("BUY:").Append(Environment.NewLine);
             
-            foreach (var (key, value) in _buyOperationHandler.HistoricalBuySellPriceToQuantityMap)
+            foreach (var (key, value) in _buyOperationHandler.BuySellPriceToQuantityMap.OrderByDescending(e => e.Key))
             {
                 result.Append($"{key} {value}").Append(Environment.NewLine);
             }
 
-            return result.ToString();
+            Console.WriteLine(result.ToString());
         }
 
         public void Process(Operation operation)
         {
- 
+            // ReSharper disable once SwitchStatementMissingSomeCases
+            switch (operation.OperationType)
+            {
+                case OperationType.Buy:
+                {
+                    var op = (BuySellOperation) operation;
+                    _buyOperationHandler.Process(op);
+                    var tradeResult = _sellOperationHandler.Trade(op);
+
+                    if (tradeResult != null && tradeResult.Any())
+                    {
+                        _buyOperationHandler.BalancePriceToQuantityMap(op);
+                        PrintTrade(op, tradeResult);
+                    }
+                    
+                    _buyOperationHandler.HandleStaleIocOperations();
+                    break;
+                }
+                case OperationType.Sell:
+                {
+                    var op = (BuySellOperation) operation;
+                    _sellOperationHandler.Process(op);
+                    var tradeResult = _buyOperationHandler.Trade(op);
+                    
+                    if (tradeResult != null && tradeResult.Any())
+                    {
+                        _sellOperationHandler.BalancePriceToQuantityMap(op);
+                        PrintTrade(op, tradeResult);
+                    }
+                    
+                    _sellOperationHandler.HandleStaleIocOperations();
+                    break;
+                }
+                case OperationType.Cancel:
+                {
+                    _buyOperationHandler.Cancel(operation.OrderId);
+                    _sellOperationHandler.Cancel(operation.OrderId);
+                    break;
+                }
+                case OperationType.Modify:
+                {
+                    var op = (ModifyOperation) operation;
+                    Modify(op);
+                    break;
+                }
+            }
         }
 
-
-
-
-        private static void PrintTrade(BuySellOperation buyOperation, BuySellOperation sellOperation)
+        private void Modify(ModifyOperation modifyOperation)
         {
-            var result = new StringBuilder();
-            result.Append("TRADE ");
+            var buyOperation = _buyOperationHandler.Find(modifyOperation.OrderId);
+            if (buyOperation != null)
+            {
+                _buyOperationHandler.Cancel(buyOperation.OrderId);
+                ReInsertModifiedBuySellOperation(buyOperation, modifyOperation);
+            }
+            else
+            {
+                var sellOperation = _sellOperationHandler.Find(modifyOperation.OrderId);
+                if (sellOperation == null) return;
+                _sellOperationHandler.Cancel(sellOperation.OrderId); 
+                ReInsertModifiedBuySellOperation(sellOperation, modifyOperation);
+            }
+        }
 
-            result.Append(buyOperation.TimeStamp > sellOperation.TimeStamp
-                ? $"{buyOperation} {sellOperation}"
-                : $"{sellOperation} {buyOperation}");
+        private void ReInsertModifiedBuySellOperation(BuySellOperation previousBuySellOperation, ModifyOperation modifyOperation)
+        {
+            if (previousBuySellOperation.OrderType == OrderType.Ioc) return;
+   
+            var newOperation = new BuySellOperation(modifyOperation.OperationType, previousBuySellOperation.OrderType,
+                modifyOperation.NewPrice, modifyOperation.NewQuantity, modifyOperation.OrderId);
 
-            Console.WriteLine(result.ToString());
+            if (modifyOperation.BuyOrSell == OperationType.Sell)
+            {
+                _sellOperationHandler.Process(newOperation);
+            }
+            else
+            {
+                _buyOperationHandler.Process(newOperation);
+            }
+        }
+
+        private static void PrintTrade(BuySellOperation input, IEnumerable<BuySellOperation> tradeResult)
+        {
+            var outPut = new StringBuilder();
+            
+            foreach (var result in tradeResult)
+            {
+                outPut.Append("TRADE ");
+                if (result.TimeStamp > input.TimeStamp)
+                {
+                    outPut.Append($"{input} {result}").Append(Environment.NewLine);
+                }
+                else
+                {
+                    outPut.Append($"{result} {input}").Append(Environment.NewLine);
+                }
+            }
+            
+            Console.WriteLine(outPut.ToString());
         }
 
         private readonly IBuySellOperationHandler _buyOperationHandler;
@@ -70,9 +178,14 @@ namespace OrderMatchingEngine
 
     internal interface IBuySellOperationHandler
     {
+        void Cancel(string orderId);
+        void HandleStaleIocOperations();
+        BuySellOperation Find(string orderId);
         void Process(BuySellOperation buySellOperation);
-        SortedSet<BuySellOperation> BuySellOperations { get; }
-        Dictionary<int, int> HistoricalBuySellPriceToQuantityMap { get; }
+        IList<BuySellOperation> Trade(BuySellOperation operation);
+        void BalancePriceToQuantityMap(BuySellOperation operation);
+        
+        Dictionary<int, int> BuySellPriceToQuantityMap { get; }
     }
 
     internal class BuySellOperationHandler : IBuySellOperationHandler
@@ -80,76 +193,119 @@ namespace OrderMatchingEngine
         public BuySellOperationHandler()
         {
             BuySellOperations = new SortedSet<BuySellOperation>();
-            HistoricalBuySellPriceToQuantityMap = new Dictionary<int, int>();
+            BuySellPriceToQuantityMap = new Dictionary<int, int>();
         }
 
         public void Process(BuySellOperation buySellOperation)
-        {
-            if (buySellOperation.OperationType != OperationType.Sell)
-                return;
-            
+        {           
             // Put the current buy / sell operation on the queue.
             BuySellOperations.Add(buySellOperation);
             
             // Add buyOperation to historical price to quantity map.
-            if (HistoricalBuySellPriceToQuantityMap.TryGetValue(buySellOperation.Price, out var quantity))
+            if (BuySellPriceToQuantityMap.TryGetValue(buySellOperation.Price, out var quantity))
             {
-                HistoricalBuySellPriceToQuantityMap[buySellOperation.Price] = quantity + buySellOperation.Quantity;
+                BuySellPriceToQuantityMap[buySellOperation.Price] = quantity + buySellOperation.Quantity;
             }
             else
             {
-                HistoricalBuySellPriceToQuantityMap.Add(buySellOperation.Price, buySellOperation.Quantity);
+                BuySellPriceToQuantityMap.Add(buySellOperation.Price, buySellOperation.Quantity);
             }
+        }
+
+        public void Cancel(string orderId)
+        {
+            var operation = Find(orderId);
+
+            if(operation == null) return;
+            
+            if (BuySellPriceToQuantityMap.TryGetValue(operation.Price, out var quantity))
+            {
+                BuySellPriceToQuantityMap[operation.Price] = quantity - operation.Quantity;
+            }
+
+            BuySellOperations.Remove(operation);
+        }
+
+        public BuySellOperation Find(string orderId)
+        {
+            foreach (var operation in BuySellOperations)
+            {
+                if (operation.OrderId == orderId)
+                    return operation;
+            }
+
+            return null;
         }
 
         public IList<BuySellOperation> Trade(BuySellOperation operation)
-        {            
+        {
             var result = new List<BuySellOperation>();
-            var quantity = operation.Quantity;
 
             for (var i = 0; i < BuySellOperations.Count; i++)
             {
-                if (quantity == 0)
+                if (operation.Quantity == 0)
                     break;
 
-                // Input is buy operation and we are searching for sell operations.
-                if (operation.OperationType == OperationType.Buy &&
-                    operation.Price >= BuySellOperations.ElementAt(i).Price)
+                if ((operation.OperationType == OperationType.Buy &&
+                     operation.Price >= BuySellOperations.ElementAt(i).Price) ||
+                    (operation.OperationType == OperationType.Sell &&
+                     operation.Price < BuySellOperations.ElementAt(i).Price))
                 {
-                    AddToTradeResult(ref quantity, result, operation, BuySellOperations.ElementAt(i));
-                }
-                // Input is sell operation and we are searching for buy operations.
-                else if(operation.OperationType == OperationType.Sell &&
-                        operation.Price < BuySellOperations.ElementAt(i).Price)
-                {
-                    AddToTradeResult(ref quantity, result, operation, BuySellOperations.ElementAt(i));
+                    AddToTradeResult(operation, result, BuySellOperations.ElementAt(i));
                 }
             }
 
+            BalancePriceToQuantityMap(result);
             return result;
         }
 
-        private void AddToTradeResult(ref int remainingQuantity, IList<BuySellOperation> result, BuySellOperation input, BuySellOperation toBeCompared)
+        public void BalancePriceToQuantityMap(BuySellOperation operation)
+        {
+            if (BuySellPriceToQuantityMap.TryGetValue(operation.Price, out var quantity))
+            {
+                BuySellPriceToQuantityMap[operation.Price] = quantity - operation.Quantity;
+            }
+        }
+
+        private void BalancePriceToQuantityMap(IEnumerable<BuySellOperation> operations)
+        {
+            foreach (var operation in operations)
+            {
+                if (BuySellPriceToQuantityMap.TryGetValue(operation.Price, out var quantity))
+                {
+                    BuySellPriceToQuantityMap[operation.Price] = quantity - operation.Quantity;
+                }
+            }
+        }
+
+        private void AddToTradeResult(BuySellOperation currentOperation, ICollection<BuySellOperation> result, BuySellOperation toBeCompared)
         {
             // Selling quantity is less equal to buying quantity.
-            if (toBeCompared.Quantity <= remainingQuantity)
+            if (toBeCompared.Quantity <= currentOperation.Quantity)
             {
                 result.Add(toBeCompared);
-                remainingQuantity -= toBeCompared.Quantity;
+                currentOperation.Quantity -= toBeCompared.Quantity;
                 BuySellOperations.Remove(toBeCompared);
             }
                     
             // If Selling quantity is greater than buying quantity.
-            else if (toBeCompared.Quantity > remainingQuantity)
+            else if (toBeCompared.Quantity > currentOperation.Quantity)
             {
                 result.Add(toBeCompared);
-                remainingQuantity -= toBeCompared.Quantity;
-                toBeCompared.Quantity -= remainingQuantity;
+                currentOperation.Quantity -= toBeCompared.Quantity;
+                toBeCompared.Quantity -= currentOperation.Quantity;
             }
         }
 
-        public SortedSet<BuySellOperation> BuySellOperations { get; }
-        public Dictionary<int, int> HistoricalBuySellPriceToQuantityMap { get; }
+        public void HandleStaleIocOperations()
+        {
+            // This means previous Ioc is still pending and needs to be removed.
+            if (BuySellOperations.ElementAt(0).OrderType == OrderType.Ioc)
+                Cancel(BuySellOperations.ElementAt(0).OrderId);
+        }
+        
+        private SortedSet<BuySellOperation> BuySellOperations { get; }
+        public Dictionary<int, int> BuySellPriceToQuantityMap { get; }
     }
 
     public abstract class Operation
@@ -159,7 +315,7 @@ namespace OrderMatchingEngine
 
         public DateTime TimeStamp { get; }
 
-        public Operation(string operationType, string orderId)
+        protected Operation(string operationType, string orderId)
         {
             TimeStamp = DateTime.UtcNow;
             OperationType = operationType;
@@ -181,10 +337,10 @@ namespace OrderMatchingEngine
         }
     }
 
-    public class BuySellOperation : Operation
+    public class BuySellOperation : Operation, IComparable<BuySellOperation>
     {
-        public string OrderType { get; set; }
-        public int Price { get; set; }
+        public string OrderType { get; }
+        public int Price { get; }
         public int Quantity { get; set; }
 
         public BuySellOperation(string operationType, string orderType, int price, int quantity, string orderId) 
@@ -193,6 +349,11 @@ namespace OrderMatchingEngine
             Price = price;
             Quantity = quantity;
             OrderType = orderType;
+        }
+
+        public int CompareTo(BuySellOperation other)
+        {
+            return TimeStamp.CompareTo(other.TimeStamp);
         }
 
         public override string ToString()
@@ -254,7 +415,7 @@ namespace OrderMatchingEngine
     public static class OrderType
     {
         public const string Ioc = "IOC";
-        public const string Gfd = "GFD";
+        private const string Gfd = "GFD";
 
         public static bool IsValid(string orderType)
         {
@@ -278,35 +439,31 @@ namespace OrderMatchingEngine
         {
             if (string.IsNullOrEmpty(argument))
                 return null;
-            
+
             var arguments = argument.Split(' ');
-            
-            if (!AreArgumentsValid(arguments))
+                                    
+            if (arguments == null || arguments.Length == 0 || !AreArgumentsValid(arguments))
                 return null;
             
-
-            switch (arguments[0])
+            switch (arguments.ElementAt(0))
             {
                 case OperationType.Buy:
                 case OperationType.Sell:
-                    return new BuySellOperation(arguments[0], arguments[1], int.Parse(arguments[2]),
-                        int.Parse(arguments[2]), arguments[3]);
-                    break;
+                    return new BuySellOperation(arguments.ElementAt(0), arguments.ElementAt(1), int.Parse(arguments.ElementAt(2)),
+                        int.Parse(arguments.ElementAt(3)), arguments.ElementAt(4));
                 case OperationType.Cancel:
-                    return new CancelOperation(arguments[0], arguments[1]);
-                    break;
+                    return new CancelOperation(arguments.ElementAt(0), arguments.ElementAt(1));
                 case OperationType.Modify:
-                    return new ModifyOperation(arguments[0], arguments[1], arguments[2], int.Parse(arguments[3]),
-                        int.Parse(arguments[4]));
-                    break;
+                    return new ModifyOperation(arguments.ElementAt(0), arguments.ElementAt(1), arguments.ElementAt(2), int.Parse(arguments.ElementAt(3)),
+                        int.Parse(arguments.ElementAt(4)));
                 default: throw new ArgumentException("Unknown operation type");
             }
         }
 
-        private static bool AreArgumentsValid(IList<string> arguments)
+        private static bool AreArgumentsValid(IReadOnlyCollection<string> arguments)
         {
-            if (!OperationType.IsValid(arguments[0])) return false;
-            return arguments[0] != OperationType.Buy || OrderType.IsValid(arguments[1]);
+            if (!OperationType.IsValid(arguments.ElementAt(0))) return false;
+            return arguments.ElementAt(0) != OperationType.Buy || OrderType.IsValid(arguments.ElementAt(1));
         }
     }
 
@@ -321,7 +478,8 @@ namespace OrderMatchingEngine
         {
             var serviceCollection = new ServiceCollection();
 
-            serviceCollection.TryAddSingleton<IBuySellOperationHandler, BuySellOperationHandler>();
+            serviceCollection.TryAddSingleton<IOperationHandler, OperationHandler>();
+            serviceCollection.TryAddTransient<IBuySellOperationHandler, BuySellOperationHandler>();
             
             return serviceCollection;
         }
