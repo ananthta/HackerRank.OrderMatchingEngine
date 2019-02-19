@@ -54,14 +54,16 @@ namespace OrderMatchingEngine
 
             foreach (var (key, value) in _sellOperationHandler.BuySellPriceToQuantityMap.OrderByDescending(e => e.Key))
             {
-                result.Append($"{key} {value}").Append(Environment.NewLine);
+                if(value > 0)
+                    result.Append($"{key} {value}").Append(Environment.NewLine);
             }
             
             result.Append("BUY:").Append(Environment.NewLine);
             
             foreach (var (key, value) in _buyOperationHandler.BuySellPriceToQuantityMap.OrderByDescending(e => e.Key))
             {
-                result.Append($"{key} {value}").Append(Environment.NewLine);
+                if(value > 0)
+                    result.Append($"{key} {value}").Append(Environment.NewLine);
             }
 
             Console.WriteLine(result.ToString());
@@ -75,14 +77,12 @@ namespace OrderMatchingEngine
                 case OperationType.Buy:
                 {
                     var op = (BuySellOperation) operation;
+                    var originalQuantity = op.Quantity;
                     _buyOperationHandler.Process(op);
                     var tradeResult = _sellOperationHandler.Trade(op);
 
                     if (tradeResult != null && tradeResult.Any())
-                    {
-                        _buyOperationHandler.BalancePriceToQuantityMap(op);
-                        PrintTrade(op, tradeResult);
-                    }
+                        _buyOperationHandler.BalancePriceToQuantityMap(op.Price, op.Quantity-originalQuantity);
                     
                     _buyOperationHandler.HandleStaleIocOperations();
                     break;
@@ -90,14 +90,12 @@ namespace OrderMatchingEngine
                 case OperationType.Sell:
                 {
                     var op = (BuySellOperation) operation;
+                    var originalQuantity = op.Quantity;
                     _sellOperationHandler.Process(op);
                     var tradeResult = _buyOperationHandler.Trade(op);
                     
                     if (tradeResult != null && tradeResult.Any())
-                    {
-                        _sellOperationHandler.BalancePriceToQuantityMap(op);
-                        PrintTrade(op, tradeResult);
-                    }
+                        _sellOperationHandler.BalancePriceToQuantityMap(op.Price, op.Quantity-originalQuantity);        
                     
                     _sellOperationHandler.HandleStaleIocOperations();
                     break;
@@ -151,26 +149,6 @@ namespace OrderMatchingEngine
             }
         }
 
-        private static void PrintTrade(BuySellOperation input, IEnumerable<BuySellOperation> tradeResult)
-        {
-            var outPut = new StringBuilder();
-            
-            foreach (var result in tradeResult)
-            {
-                outPut.Append("TRADE ");
-                if (result.TimeStamp > input.TimeStamp)
-                {
-                    outPut.Append($"{input} {result}").Append(Environment.NewLine);
-                }
-                else
-                {
-                    outPut.Append($"{result} {input}").Append(Environment.NewLine);
-                }
-            }
-            
-            Console.WriteLine(outPut.ToString());
-        }
-
         private readonly IBuySellOperationHandler _buyOperationHandler;
         private readonly IBuySellOperationHandler _sellOperationHandler;
     }
@@ -182,6 +160,7 @@ namespace OrderMatchingEngine
         void HandleStaleIocOperations();
         BuySellOperation Find(string orderId);
         void Process(BuySellOperation buySellOperation);
+        void BalancePriceToQuantityMap(int price, int quantity);
         IList<BuySellOperation> Trade(BuySellOperation operation);
         void BalancePriceToQuantityMap(BuySellOperation operation);
         
@@ -217,11 +196,8 @@ namespace OrderMatchingEngine
             var operation = Find(orderId);
 
             if(operation == null) return;
-            
-            if (BuySellPriceToQuantityMap.TryGetValue(operation.Price, out var quantity))
-            {
-                BuySellPriceToQuantityMap[operation.Price] = quantity - operation.Quantity;
-            }
+
+            BalancePriceToQuantityMap(operation);
 
             BuySellOperations.Remove(operation);
         }
@@ -240,7 +216,8 @@ namespace OrderMatchingEngine
         public IList<BuySellOperation> Trade(BuySellOperation operation)
         {
             var result = new List<BuySellOperation>();
-
+            var operationsToBeRemoved = new List<BuySellOperation>();
+            
             for (var i = 0; i < BuySellOperations.Count; i++)
             {
                 if (operation.Quantity == 0)
@@ -249,52 +226,75 @@ namespace OrderMatchingEngine
                 if ((operation.OperationType == OperationType.Buy &&
                      operation.Price >= BuySellOperations.ElementAt(i).Price) ||
                     (operation.OperationType == OperationType.Sell &&
-                     operation.Price < BuySellOperations.ElementAt(i).Price))
+                     operation.Price <= BuySellOperations.ElementAt(i).Price))
                 {
-                    AddToTradeResult(operation, result, BuySellOperations.ElementAt(i));
+                    AddToTradeResult(operation, result, BuySellOperations.ElementAt(i), operationsToBeRemoved);
                 }
             }
 
-            BalancePriceToQuantityMap(result);
+            foreach (var operationToBeRemoved in operationsToBeRemoved)
+            {
+                Cancel(operationToBeRemoved.OrderId);
+            }
+
             return result;
         }
 
         public void BalancePriceToQuantityMap(BuySellOperation operation)
         {
-            if (BuySellPriceToQuantityMap.TryGetValue(operation.Price, out var quantity))
+            if (BuySellPriceToQuantityMap.TryGetValue(operation.Price, out _))
             {
-                BuySellPriceToQuantityMap[operation.Price] = quantity - operation.Quantity;
+                BuySellPriceToQuantityMap[operation.Price] -= operation.Quantity;
+            }
+        }
+        
+        public void BalancePriceToQuantityMap(int price, int quantity)
+        {
+            if (BuySellPriceToQuantityMap.TryGetValue(price, out _))
+            {
+                BuySellPriceToQuantityMap[price] += quantity;
             }
         }
 
-        private void BalancePriceToQuantityMap(IEnumerable<BuySellOperation> operations)
-        {
-            foreach (var operation in operations)
-            {
-                if (BuySellPriceToQuantityMap.TryGetValue(operation.Price, out var quantity))
-                {
-                    BuySellPriceToQuantityMap[operation.Price] = quantity - operation.Quantity;
-                }
-            }
-        }
-
-        private void AddToTradeResult(BuySellOperation currentOperation, ICollection<BuySellOperation> result, BuySellOperation toBeCompared)
-        {
+        private void AddToTradeResult(BuySellOperation currentOperation, ICollection<BuySellOperation> result, BuySellOperation toBeCompared, IList<BuySellOperation> toBeRemoved)
+        {         
             // Selling quantity is less equal to buying quantity.
             if (toBeCompared.Quantity <= currentOperation.Quantity)
             {
                 result.Add(toBeCompared);
                 currentOperation.Quantity -= toBeCompared.Quantity;
-                BuySellOperations.Remove(toBeCompared);
-            }
-                    
+                toBeRemoved.Add(toBeCompared);
+            }                  
             // If Selling quantity is greater than buying quantity.
             else if (toBeCompared.Quantity > currentOperation.Quantity)
             {
+                var originalQuantity = currentOperation.Quantity;
                 result.Add(toBeCompared);
-                currentOperation.Quantity -= toBeCompared.Quantity;
-                toBeCompared.Quantity -= currentOperation.Quantity;
+                currentOperation.Quantity = originalQuantity - toBeCompared.Quantity < 0
+                    ? 0
+                    : originalQuantity - toBeCompared.Quantity;
+                toBeCompared.Quantity -= originalQuantity;
+                BalancePriceToQuantityMap(toBeCompared);
             }
+            PrintTrade(currentOperation, toBeCompared);
+        }
+
+        private static void PrintTrade(BuySellOperation input, BuySellOperation tradeResult)
+        {
+            var outPut = new StringBuilder();
+
+            outPut.Append("TRADE ");
+            if (tradeResult.TimeStamp > input.TimeStamp)
+            {
+                outPut.Append($"{input} {tradeResult.Quantity} {tradeResult} {tradeResult.Quantity}").Append(Environment.NewLine);
+            }
+            else
+            {
+                outPut.Append($"{tradeResult} {tradeResult.Quantity} {input} {tradeResult.Quantity}").Append(Environment.NewLine);
+            }
+
+
+            Console.Write(outPut.ToString());
         }
 
         public void HandleStaleIocOperations()
@@ -359,7 +359,7 @@ namespace OrderMatchingEngine
         public override string ToString()
         {
             var result = new StringBuilder();
-            result.Append($"{OrderId} {Price} {Quantity}");
+            result.Append($"{OrderId} {Price} ");
             return result.ToString();
         }
     }
